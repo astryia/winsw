@@ -23,24 +23,71 @@ namespace winsw.Util
         /// <returns>List of child process PIDs</returns>
         public static List<int> GetChildPids(int pid)
         {
+            return GetChildPids(pid, TryGetProcessStartTime(pid));
+        }
+
+        /// <summary>
+        /// Gets all children of the specified process filtered by process start time
+        /// </summary>
+        /// <param name="pid">Process PID</param>
+        /// <param name="processStartTime">Process start time</param>
+        /// <returns>List of child process PIDs</returns>
+        public static List<int> GetChildPids(int pid, DateTime? processStartTime)
+        {
             var childPids = new List<int>();
-            
-            try {
-                var searcher = new ManagementObjectSearcher("Select * From Win32_Process Where ParentProcessID=" + pid);
-                foreach (var mo in searcher.Get())
-                {
-                    var childProcessId = mo["ProcessID"];
-                    Logger.Info("Found child process: " + childProcessId + " Name: " + mo["Name"]);
-                    childPids.Add(Convert.ToInt32(childProcessId));
-                }
+
+            try
+            {
+                using (var searcher = new ManagementObjectSearcher("Select * From Win32_Process Where ParentProcessID=" + pid))
+                    foreach (var mo in searcher.Get())
+                        using (mo)
+                        {
+                            var childProcessId = Convert.ToInt32(mo["ProcessID"]);
+                            if (processStartTime.HasValue)
+                            {
+                                DateTime childStartTime =
+                                    ManagementDateTimeConverter.ToDateTime(mo["CreationDate"].ToString());
+                                if (childStartTime < processStartTime)
+                                {
+                                    childProcessId = 0;
+                                    Logger.Info(string.Format("Child process {0} ({1}) start time cannot be earlier than parent. Skipping", mo["Name"], childProcessId));
+                                }
+                            }
+
+                            if (childProcessId != 0)
+                            {
+                                Logger.Info(string.Format("Found child process: {0} Name: {1}", childProcessId, mo["Name"]));
+                                childPids.Add(childProcessId);
+                            }
+                        }
             }
             catch (Exception ex)
             {
                 Logger.Warn("Failed to locate children of the process with PID=" + pid + ". Child processes won't be terminated", ex);
             }
-            
+
             return childPids;
         }
+
+        /// <summary>
+        /// Tries to get the start time of the process
+        /// </summary>
+        /// <param name="pid">Process ID</param>
+        /// <returns>Process start time or null</returns>
+        public static DateTime? TryGetProcessStartTime(int pid)
+        {
+            try
+            {
+                using (var process = Process.GetProcessById(pid))
+                    return process.StartTime;
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn(string.Format("Failed to get process start time PID={0}", pid), ex);
+                return null;
+            }
+        }
+
 
         /// <summary>
         /// Stops the process.
@@ -97,13 +144,15 @@ namespace winsw.Util
         /// <param name="pid">Process PID</param>
         /// <param name="stopTimeout">Stop timeout (for each process)</param>
         /// <param name="stopParentProcessFirst">If enabled, the perent process will be terminated before its children on all levels</param>
-        public static void StopProcessAndChildren(int pid, TimeSpan stopTimeout, bool stopParentProcessFirst)
+        /// <param name="parentProcessStartTime">Process start time. Will be used to filter child processes</param>
+        public static void StopProcessAndChildren(int pid, TimeSpan stopTimeout, bool stopParentProcessFirst, DateTime? parentProcessStartTime = null)
         {
+            parentProcessStartTime = parentProcessStartTime ?? TryGetProcessStartTime(pid);
             if (!stopParentProcessFirst)
             {         
-                foreach (var childPid in GetChildPids(pid))
+                foreach (var childPid in GetChildPids(pid, parentProcessStartTime))
                 {
-                    StopProcessAndChildren(childPid, stopTimeout, stopParentProcessFirst);
+                    StopProcessAndChildren(childPid, stopTimeout, false, parentProcessStartTime);
                 }
             }
 
@@ -111,12 +160,13 @@ namespace winsw.Util
 
             if (stopParentProcessFirst)
             {
-                foreach (var childPid in GetChildPids(pid))
+                foreach (var childPid in GetChildPids(pid, parentProcessStartTime))
                 {
-                    StopProcessAndChildren(childPid, stopTimeout, stopParentProcessFirst);
+                    StopProcessAndChildren(childPid, stopTimeout, true, parentProcessStartTime);
                 }
             }
         }
+
 
         /// <summary>
         /// Starts a process and asynchronosly waits for its termination.
